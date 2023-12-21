@@ -200,7 +200,6 @@ import {
     FlowAssignment,
     FlowCall,
     FlowCondition,
-    FlowContainer,
     FlowFlags,
     FlowLabel,
     FlowNode,
@@ -366,7 +365,6 @@ import {
     getThisParameter,
     getTrailingSemicolonDeferringWriter,
     getTypeParameterFromJsDoc,
-    getTypeParameterOwner,
     getUseDefineForClassFields,
     group,
     hasAbstractModifier,
@@ -411,6 +409,7 @@ import {
     ImportClause,
     ImportDeclaration,
     ImportEqualsDeclaration,
+    ImportMetaProperty,
     ImportOrExportSpecifier,
     ImportsNotUsedAsValues,
     ImportSpecifier,
@@ -975,6 +974,7 @@ import {
     StructuredType,
     SubstitutionType,
     SuperCall,
+    SuperExpression,
     SwitchStatement,
     Symbol,
     SymbolAccessibility,
@@ -1483,6 +1483,17 @@ export function createTypeChecker(host: TypeCheckerHost): TypeChecker {
     var lastGetCombinedModifierFlagsNode: Declaration | undefined;
     var lastGetCombinedModifierFlagsResult = ModifierFlags.None;
 
+    type NodeId = number;
+    // >> TODO: this could just be `Expression`
+    type QueryReference =
+        | Identifier
+        | PropertyAccessExpression
+        | ElementAccessExpression
+        | ImportMetaProperty
+        | SuperExpression
+        | ThisExpression;
+    type QueryReferences = [Symbol, QueryReference, TypeParameter][];
+    var queryTypeParameterReferencesCache: Map<NodeId, QueryReferences> = new Map();
     // for public members that accept a Node or one of its subtypes, we must guard against
     // synthetic nodes created during transformations by calling `getParseTreeNode`.
     // for most of these, we perform the guard only on `checker` to avoid any possible
@@ -43424,27 +43435,28 @@ export function createTypeChecker(host: TypeCheckerHost): TypeChecker {
                     /* Begin weird stuff */
                     const outerTypeParameters = getOuterTypeParameters(container!, /*includeThisTypes*/ false);
                     const typeParameters = appendTypeParameters(outerTypeParameters, getEffectiveTypeParameterDeclarations(container as DeclarationWithTypeParameters));
-                    const queryTypeParameters = typeParameters?.filter(isQueryTypeParameter);
+                    // const queryTypeParameters = typeParameters?.filter(isQueryTypeParameter);
+                    const queryTypeParameters = typeParameters && filterQueryTypeParameters((container as SignatureDeclaration), typeParameters);
                     if (queryTypeParameters) {
                         const narrowParent = expr
                             ? isConditionalExpression(expr.parent)
                                 ? expr
                                 : expr.parent
                             : node;
-                        const narrowed: [TypeParameter, Type][] = mapDefined(queryTypeParameters, tp => {
-                            const narrowReference = factory.cloneNode(tp.exprName); // Construct a reference that can be narrowed.
+                        const narrowed: [TypeParameter, Type][] = mapDefined(queryTypeParameters, ([tp, symbol, reference]) => {
+                            const narrowReference = factory.cloneNode(reference); // Construct a reference that can be narrowed.
                             // Set the symbol of the synthetic reference.
                             // This allows us to get the type of the reference at a location where the reference is possibly shadowed.
-                            getNodeLinks(narrowReference).resolvedSymbol = getResolvedSymbol(tp.exprName);
+                            // >> TODO: see if this works with any kind of reference...
+                            // this will depend on how `checkX` is implemented.
+                            // It works for `checkIdentifier`,
+                            // possibly doesn't work for `checkPropertyAccessExpression`.
+                            getNodeLinks(narrowReference).resolvedSymbol = symbol;
                             setParent(narrowReference, narrowParent.parent);
                             setNodeFlags(narrowReference, narrowReference.flags | NodeFlags.Synthesized);
+                            // >> TODO: get rid of this cast?
                             narrowReference.flowNode = (narrowParent as HasFlowNode).flowNode;
-                            // >> TODO: this call to checkExpression might report errors,
-                            // >> and so might throw when trying to get span for fakeName.
-                            // >> TODO: also, it shouldn't throw errors. Maybe we can reuse `CheckMode.TypeOnly`?
-                            // const exprType = checkExpression(narrowReference);
-                            // We don't want to emit errors when getting the type.
-                            const exprType = getTypeOfExpression(narrowReference); // >> TODO: that doesn't work for qualified names
+                            const exprType = getTypeOfExpression(narrowReference);
                             // >> TODO: is there a better way of detecting that narrowing will be useless?
                             if (getConstraintOfTypeParameter(tp)) {
                                 const narrowableConstraintType = mapType(tp.constraint!, getBaseConstraintOrType);
@@ -43499,154 +43511,209 @@ export function createTypeChecker(host: TypeCheckerHost): TypeChecker {
         }
     }
 
-    function isQueryTypeParameter(typeParameter: TypeParameter): typeParameter is TypeParameter & { exprName: Identifier } {
-        if (isThisTypeParameter(typeParameter)) {
-            return false;
+    function filterQueryTypeParameters(container: SignatureDeclaration, typeParameters: TypeParameter[]): [TypeParameter, Symbol, QueryReference][] | undefined {
+        const queryTypeParameterReferences = collectQueryTypeParameterReferences(container);
+        const paramToReferences: Map<TypeId, Map<SymbolId, [Symbol, QueryReference]>> = new Map();
+        for (const [symbol, reference, typeParam] of queryTypeParameterReferences) {
+            const id = getTypeId(typeParam);
+            if (!paramToReferences.has(id)) {
+                paramToReferences.set(id, new Map());
+            }
+            const symbolMap = paramToReferences.get(id)!;
+            symbolMap.set(getSymbolId(symbol), [symbol, reference]);
         }
-        if (!typeParameter.symbol) {
-            return false;
-            // >> TODO: deal with synthetic tps?
-        }
-        if (typeParameter.exprName) {
-            return true;
-        }
-        if (typeParameter.exprName === null) {
-            return false;
-        }
-
-        typeParameter.exprName = null;
-        // Type parameter should have a type parameter declaration because it is not a `this` type parameter, and it has a symbol.
-        const declaration = getDeclarationOfKind(typeParameter.symbol, SyntaxKind.TypeParameter)!;
-        const owner = getTypeParameterOwner(declaration);
-        if (!owner || !isFunctionLikeDeclaration(owner)) {
-            return false; // Owner is class or interface, or a signature without an implementation
-        }
-        const references: Node[] = []; // All parameter type nodes that look like `T` that resolve to the type parameter.
-        owner.parameters.forEach(parameter => parameter.type && collectReferences(parameter.type));
-        if (references.length === 1) {
-            const reference = references[0];
-            let exprName;
-            if (isParameter(reference.parent) &&
-                reference.parent.parent === owner &&
-                (exprName = getNameOfDeclaration(reference.parent)) &&
-                isIdentifier(exprName)) {
-                // If the parameter is optional, and its type is a type parameter whose constraint doesn't allow for `undefined`, then we can't narrow, because the type parameter doesn't reflect the full type of the parameter.
-                // For instance, if we have:
-                // `function f<T extends string>(x?: T): ReturnType<T> {
-                //      if (typeof x === "undefined") {
-                //          ...
-                //      }    
-                // }`,
-                // The type of `x` is really `T | undefined`,
-                // and we can't narrow type parameter `T` with type `undefined` inside the `if` statement, because
-                // `undefined` does not satisfy `T`'s constraint, `string`.
-                // >> TODO: if we allow the type parameter to be the type of a *property*, we need to update this code because the property could be optional and it could also contain the missing type instead of simply the undefined type.
-                let constraint;
-                if (isOptionalParameter(reference.parent) &&
-                    (constraint = getConstraintOfTypeParameter(typeParameter)) &&
-                    !containsUndefinedType(constraint)) {
-                    return false;
-                }
-                typeParameter.exprName = exprName;
-                return true;
+        const queryParameters: [TypeParameter, Symbol, QueryReference][] = [];
+        for (const typeParam of typeParameters) {
+            const id = getTypeId(typeParam);
+            const symbolMap = paramToReferences.get(id);
+            if (!symbolMap) continue;
+            if (symbolMap.size === 1) {
+                const [symbol, reference] = firstIterator(symbolMap.values());
+                queryParameters.push([typeParam, symbol, reference]);
             }
         }
-        return false;
-
-        function collectReferences(node: Node) {
-            if (isTypeReferenceNode(node)) {
-                const type = getTypeFromTypeNode(node);
-                if (type.flags & TypeFlags.TypeParameter && getActualTypeVariable(type) === typeParameter) {
-                    references.push(node);
-                }
-                return;
-            }
-            forEachChild(node, collectReferences);
-        }
+        return queryParameters.length ? queryParameters : undefined;
     }
 
-    function collectQueryTypeParameterReferences(typeParameter: TypeParameter, endFlowNode: FlowNode) {
-        // >> TODO: this should not be node, should be identifier or prop access
-        const references: Node[] = [];
-        visitFlowNode(endFlowNode, collect);
+    function collectQueryTypeParameterReferences(container: SignatureDeclaration): QueryReferences {
+        const references: QueryReferences = [];
+        const nodeId = getNodeId(container);
+        if (!queryTypeParameterReferencesCache.has(nodeId)) {
+            const flowNodes = collectFlowNodes(container);
+            // >> TODO: this will cause us to possibly visit the same flow nodes more than once.
+            // >> Dedupe work.
+            flowNodes.forEach(flowNode => visitFlowNode(flowNode, collect));
+            queryTypeParameterReferencesCache.set(nodeId, references);
+        }
+        return queryTypeParameterReferencesCache.get(nodeId)!;
+
         function collect(flow: FlowNode) {
             const flags = flow.flags;
-            // Based on `getTypeAtFlowX` functions
-            // >> Assignment: narrow lvalue?
-            // >> Call: narrow arguments if call is to a predicate
+            // Based on `getTypeAtFlowX` functions.
             let node;
             if (flags & FlowFlags.Assignment) {
                 node = (flow as FlowAssignment).node;
             }
-            if (flags & FlowFlags.Call) {
+            else if (flags & FlowFlags.Call) {
                 node = (flow as FlowCall).node;
             }
-            // Expression: go into binary expressions, etc
-            if (flags & FlowFlags.Condition) {
+            else if (flags & FlowFlags.Condition) {
                 node = (flow as FlowCondition).node;
             }
-            // same as expression/condition
-            if (flags & FlowFlags.SwitchClause) {
-                // switch condition
+            else if (flags & FlowFlags.SwitchClause) {
                 node = (flow as FlowSwitchClause).switchStatement.expression;
             }
-            // from `getTypeAtFlowArrayMutation`
-            if (flags & FlowFlags.ArrayMutation) {
+            else if (flags & FlowFlags.ArrayMutation) {
                 const callNode = (flow as FlowArrayMutation).node;
                 node = callNode.kind === SyntaxKind.CallExpression ?
                     (callNode.expression as PropertyAccessExpression).expression :
                     (callNode.left as ElementAccessExpression).expression;
             }
-            getReferences(node);
+            if (node) getReferences(node);
         }
-        
-        // >> TODO: maybe refine the type `Node` here based on the above types
-        // >> TODO: get the type of the references here as well
-        // >> TODO: what does the control flow graph look like for e.g. an `if` with a condition that is
-        // an || or && ???
-        // Based on `isMatchingReference`
+
+        // >> TODO: Based on `isMatchingReference`?
+        // >> TODO: needs to be based on `narrowType` as well.
+        // If `node` came from a flow condition's condition, then it is going to be analyzed by
+        // `narrowType`.
         function getReferences(node: Node): void {
             switch (node.kind) {
                 case SyntaxKind.ParenthesizedExpression:
                 case SyntaxKind.NonNullExpression:
                     return getReferences((node as NonNullExpression | ParenthesizedExpression).expression);
                 case SyntaxKind.BinaryExpression:
-                    if (isAssignmentExpression(node)) {
-                        getReferences(node.left);
+                    getReferences((node as BinaryExpression).left);
+                    getReferences((node as BinaryExpression).right);
+                    return;
+                case SyntaxKind.CallExpression:
+                    let callAccess;
+                    // `node` is `expr.hasOwnExpression(prop)`
+                    if (isPropertyAccessExpression(callAccess = (node as CallExpression).expression) && isIdentifier(callAccess.name) && callAccess.name.escapedText === "hasOwnProperty" && (node as CallExpression).arguments.length === 1 && isStringLiteralLike((node as CallExpression).arguments[0])) {
+                        const propName = (node as CallExpression).arguments[0] as StringLiteralLike;
+                        const synthPropertyAccess =
+                            canUsePropertyAccess(propName.text, languageVersion) ?
+                                factory.createPropertyAccessExpression(callAccess.expression, propName.text) :
+                                factory.createElementAccessExpression(callAccess.expression, propName);
+                        setParent(synthPropertyAccess, node.parent);
+                        addReference(synthPropertyAccess);
                     }
-                    if (isBinaryExpression(node) && node.operatorToken.kind === SyntaxKind.CommaToken) {
-                        getReferences(node.right);
-                    }
+                    getReferences((node as CallExpression).expression); // >> TODO: do we need this?
+                    // This is relevant for type predicate-based narrowing.
+                    (node as CallExpression).arguments.forEach(getReferences);
                     return;
-                case SyntaxKind.MetaProperty:
-                    references.push(node);
-                    // >> TODO: I think you can never actually have `import.meta` or
-                    // `new.target` involved in narrowing, so this might be pointless
+                case SyntaxKind.PrefixUnaryExpression:
+                case SyntaxKind.PostfixUnaryExpression: // >> TODO: do we need this?
+                    getReferences((node as PrefixUnaryExpression | PostfixUnaryExpression).operand);
                     return;
-                case SyntaxKind.ThisKeyword:
-                    references.push(node);
+                case SyntaxKind.TypeOfExpression:
+                    getReferences((node as TypeOfExpression).expression);
                     return;
-                case SyntaxKind.Identifier:
-                case SyntaxKind.PrivateIdentifier:
-                    references.push(node);
+                case SyntaxKind.VoidExpression:
+                case SyntaxKind.AwaitExpression:
+                case SyntaxKind.YieldExpression:
+                    // We won't narrow `e` in `await e`, `void e` or `yield e`.
                     return;
                 case SyntaxKind.BindingElement:
                 case SyntaxKind.VariableDeclaration:
                     // >> TODO: get name of variable declaration/binding element and use that as ref?
                     // Can we get away with skipping this?
                     return;
+                case SyntaxKind.MetaProperty:
+                    if ((node as MetaProperty).keywordToken === SyntaxKind.ImportKeyword) {
+                        addReference((node as ImportMetaProperty));
+                    }
+                    // >> TODO: I think you can never actually have `import.meta` or
+                    // `new.target` involved in narrowing, so this might be pointless
+                    return;
+                case SyntaxKind.ThisKeyword:
+                    addReference((node as ThisExpression));
+                    return;
+                case SyntaxKind.Identifier:
+                    addReference((node as Identifier));
+                    return;
+                case SyntaxKind.PrivateIdentifier:
+                    // Don't add private identifiers as a reference.
+                    // They're only a narrowable reference when used in a property access expression,
+                    // as in `this.#privateId`.
+                    return;
                 case SyntaxKind.SuperKeyword:
-                    // >> TODO: is this ever relevant?
-                    references.push(node);
+                    addReference((node as SuperExpression));
                     return;
                 case SyntaxKind.PropertyAccessExpression:
                 case SyntaxKind.ElementAccessExpression:
-                    const type = getTypeOfSymbol(symbol);
-                    references.push(node);
+                    addReference((node as PropertyAccessExpression | ElementAccessExpression));
                     return;
-                case SyntaxKind.QualifiedName:
-                    // >> TODO: can this happen? we don't ever match on target being this
-                    return;
+            }
+        }
+
+        // >> TODO: can reference be a synthetic node?
+        function addReference(reference: QueryReference): void {
+            // >> TODO: pick only one of those?
+            const symbol = getSymbolAtLocation(reference, /*ignoreErrors*/ true) || getSymbolForExpression(reference);
+            const type = symbol && getTypeOfSymbol(symbol);
+            if (!type || isErrorType(type)) return;
+            // Check if we have an optional parameter, an optional property, or an optional tuple element.
+            // In this case, its type can be `T | undefined`,
+            // and if `T` allows for the undefined type, then we can still narrow `T`.
+            if (((symbol.valueDeclaration && isOptionalDeclaration(symbol.valueDeclaration))
+                || isOptionalTupleElementSymbol(symbol))
+                && type.flags & TypeFlags.Union
+                && (type as UnionType).types[0] === undefinedOrMissingType
+                && (type as UnionType).types[1].flags & TypeFlags.TypeParameter) {
+                const typeParam = (type as UnionType).types[1] as TypeParameter;
+                const constraint = getConstraintOfTypeParameter(typeParam);
+                if (!constraint || containsUndefinedType(constraint)) {
+                    references.push([symbol, reference, typeParam]);
+                }
+            }
+            else if (type.flags & TypeFlags.TypeParameter) {
+                references.push([symbol, reference, type as TypeParameter]);
+            }
+        }
+    }
+
+    function isOptionalTupleElementSymbol(symbol: Symbol): boolean {
+        if (isTransientSymbol(symbol)
+            && symbol.links.target
+            && isTransientSymbol(symbol.links.target)
+            && symbol.links.target.links.tupleLabelDeclaration) {
+            return !!symbol.links.target.links.tupleLabelDeclaration?.questionToken
+        }
+        return false;
+    }
+
+    function collectFlowNodes(container: SignatureDeclaration): FlowNode[] {
+        const flowNodes = [];
+        visit(container);
+        if (isFunctionLikeDeclaration(container) && container.endFlowNode) {
+            flowNodes.push(container.endFlowNode);
+        }
+        return flowNodes;
+
+        function visit(node: Node) {
+            if (node.kind === SyntaxKind.ReturnStatement) {
+                const nodeContainer = getContainingFunctionOrClassStaticBlock((node as ReturnStatement));
+                if (nodeContainer === container) {
+                    visitConditionalReturnExpression((node as ReturnStatement).expression);
+                    if ((node as ReturnStatement).flowNode) {
+                        flowNodes.push((node as ReturnStatement).flowNode);
+                    }
+                }
+                return;
+            }
+
+            forEachChild(node, visit);
+        }
+
+        function visitConditionalReturnExpression(node: Expression | undefined): void {
+            if (!node) return;
+            node = skipParentheses(node, /*excludeJSDocTypeAssertions*/ false);
+            if (isConditionalExpression(node)) {
+                visitConditionalReturnExpression(node.whenTrue);
+                visitConditionalReturnExpression(node.whenFalse);
+            }
+            else if ((node as HasFlowNode).flowNode) {
+                flowNodes.push((node as HasFlowNode).flowNode);
             }
         }
     }
